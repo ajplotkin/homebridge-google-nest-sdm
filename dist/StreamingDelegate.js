@@ -25,9 +25,13 @@ class StreamingDelegate {
         this.camera = camera;
         this.accessory = accessory;
         api.on("shutdown" /* SHUTDOWN */, () => {
+            var _a;
             for (const session in this.ongoingSessions) {
                 this.stopStream(session);
             }
+            // Stop the prebuffer rings too. Their reader ffmpegs would otherwise outlive the
+            // bridge until they happen to take a SIGPIPE.
+            (_a = this.prebufferManager()) === null || _a === void 0 ? void 0 : _a.stopAll();
         });
         this.options = {
             cameraStreamCount: camera.getResolutions().length,
@@ -55,7 +59,19 @@ class StreamingDelegate {
             recording: {
                 delegate: this,
                 options: {
-                    prebufferLength: 4000,
+                    // Advertise the pre-roll we can actually serve. HomeKit does not merely bound its
+                    // request by this value, it TRIMS the stored clip to it: a measured event
+                    // (2026-07-29 16:06) had ~11s of history served and the kept clip began at exactly
+                    // trigger-minus-4s, with everything earlier discarded. Leaving this at 4000 while
+                    // the ring serves 15s therefore throws away most of what the feature exists to
+                    // recover — and since the recording request itself arrives seconds AFTER the event
+                    // timestamp, a 4s ceiling means the median clip still starts after the subject has
+                    // gone, which is the whole defect.
+                    //
+                    // Unchanged at 4000 when the prebuffer is off, so nobody who hasn't enabled it sees
+                    // a different advertisement. (That the stock value promises 4s of pre-trigger
+                    // footage the plugin has never delivered is a separate issue — potmat#233.)
+                    prebufferLength: this.advertisedPrebufferLength(),
                     mediaContainerConfiguration: {
                         type: 0 /* FRAGMENTED_MP4 */,
                         fragmentLength: 4000,
@@ -484,6 +500,18 @@ class StreamingDelegate {
         catch (error) {
             this.log.error("Encountered unexpected error on generator " + error.stack);
         }
+        finally {
+            // Release this recording's ring subscription HERE rather than relying on the hub.
+            // hap-nodejs does eventually call closeRecordingStream — on a generator throw
+            // immediately, but on a clean return without isLast only via a ~12s timeout — and
+            // until it does, a finished recording keeps a subscriber attached and its queue
+            // filling at ~150KB/s. Destroying the source is idempotent and also ends ffmpeg's
+            // stdin, so the child exits instead of waiting on input that will never come.
+            try {
+                prebufferStream === null || prebufferStream === void 0 ? void 0 : prebufferStream.destroy();
+            }
+            catch (e) { /* already gone */ }
+        }
     }
     /**
      * This camera's stream name on the local RTSP restreamer, or undefined when the
@@ -496,9 +524,28 @@ class StreamingDelegate {
         if (!this.config.prebufferRtspBase)
             return undefined;
         const sourceName = this.camera.getSourceName();
+        // A configured override is used VERBATIM. It exists precisely for stream names the slug
+        // rule cannot produce — Home Assistant's bundled go2rtc names streams `camera.front_door`,
+        // and dots, dashes and capitals are all destroyed by the slug. Slugifying the user's own
+        // value would leave no way to express those names at all, and the symptom is silent: the
+        // ring 404s forever, backs off to the five-minute cap, and every recording quietly falls
+        // back to a direct dial with no indication the override was ignored.
         const configured = (_a = this.config.prebufferStreamNames) === null || _a === void 0 ? void 0 : _a[sourceName];
-        const key = (configured || sourceName).toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+        if (configured)
+            return configured;
+        const key = sourceName.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
         return key || undefined;
+    }
+    /**
+     * The `prebufferLength` to advertise to HomeKit. Bounded at 15s: the hub treats this as the
+     * amount of pre-trigger footage to KEEP, and advertising more than the ring retains would
+     * promise history that does not exist.
+     */
+    advertisedPrebufferLength() {
+        const seconds = this.config.prebufferSeconds || 0;
+        if (!this.config.prebufferRtspBase || seconds <= 0)
+            return 4000;
+        return Math.min(seconds * 1000, 15000);
     }
     prebufferManager() {
         if (!this.config.prebufferRtspBase)

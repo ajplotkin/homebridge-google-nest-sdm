@@ -73,6 +73,10 @@ export default class HksvStreamer {
         await promise;
 
         if (this.destroyed) {
+            // destroy() ran while we were awaiting 'listening'. Close the server we just
+            // opened; returning without it leaves a listening socket for the life of the
+            // process.
+            try { this.server.close(() => { /* ignore "not running" */ }); } catch (e) { /* not listening */ }
             return;
         }
 

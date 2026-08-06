@@ -84,8 +84,8 @@
         "required": false,
         "default": 0,
         "minimum": 0,
-        "maximum": 30,
-        "description": "How much footage from before the trigger to prepend to a recording. 0 disables the feature. The HomeKit hub selects its own prebuffer length and that selection wins when it is smaller. Only used when a Local RTSP Base URL is set."
+        "maximum": 15,
+        "description": "How much footage from before the trigger to prepend to a recording. 0 disables the feature. This value is also advertised to HomeKit as prebufferLength, and the hub TRIMS the stored clip to it, so it bounds what is actually kept. Capped at 15s, and it must not exceed the ring retention below. Only used when a Local RTSP Base URL is set."
       },
       "prebufferRetainSeconds": {
         "title": "HKSV Prebuffer: Ring Retention (seconds)",
