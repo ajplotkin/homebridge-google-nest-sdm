@@ -222,6 +222,9 @@ class CameraBuffer {
     private dtsClamps: number[] = [];
     private lastClampLogAt = 0;
 
+    // Video geometry last reported by this run, to catch a mid-session resolution change.
+    private lastGeometry?: string;
+
     constructor(log: Logger, name: string, url: string, ffmpegPath: string, bufferSeconds: number) {
         this.log = log;
         this.name = name;
@@ -271,6 +274,10 @@ class CameraBuffer {
         this.sawInitThisRun = false;
         this.initAtThisRun = 0;
         this.exitHandled = false;
+        // Per-run: the next child writes a fresh init segment, so the geometry it reports
+        // first is the new baseline. Carrying the old value across a restart would fire the
+        // detector on the very geometry the new init segment correctly describes.
+        this.lastGeometry = undefined;
         this.pending = Buffer.alloc(0);
         this.pendingMoof = undefined;
 
@@ -377,6 +384,37 @@ class CameraBuffer {
             if (/RTP: PT=\d+: bad cseq/.test(s)) {
                 this.log.warn(`[prebuffer:${this.name}] RTP discontinuity (${s.split("\n")[0]}); restarting reader to re-anchor the timeline`);
                 this.killChild();
+                return;
+            }
+
+            // A camera that renegotiates resolution MID-SESSION poisons the ring the same way
+            // a timestamp re-base does, and for a structural reason: an fMP4 track declares its
+            // dimensions once, in the init segment, and cannot re-declare them. After the first
+            // switch the track no longer matches its samples -- video freezes while audio plays
+            // on, for every clip cut from that ring, until something re-anchors it.
+            //
+            // Reported by @littlepope81 (potmat/homebridge-google-nest-sdm#238) on newer Nest
+            // hardware that alternates 640x368 and 1920x1088 within one session, 31 and 9
+            // decoder reinits in a day on two cameras. It reproduces under `-c copy` AND under
+            // transcode-without-scale, so it is not an encoder problem -- the geometry change
+            // reaches the muxer either way. None of the four cameras here has ever done it.
+            //
+            // Best-effort by construction: with `-c copy` ffmpeg does not decode, so whether a
+            // geometry change surfaces on stderr at all depends on the build and on the parser
+            // noticing the new SPS. When it does surface we re-anchor; when it does not we are
+            // no worse off than before. Deliberately NOT thresholded like the DTS-clamp rule --
+            // one genuine geometry change is already fatal to the init segment, so there is no
+            // benign burst to ride out.
+            const geometry = /Reinit context to (\d+x\d+)/.exec(s);
+            if (geometry) {
+                const seen = geometry[1];
+                if (this.lastGeometry && this.lastGeometry !== seen) {
+                    this.log.warn(`[prebuffer:${this.name}] video geometry changed mid-session (${this.lastGeometry} -> ${seen}); the init segment can no longer describe this track, so restarting the reader to re-anchor`);
+                    this.lastGeometry = seen;
+                    this.killChild();
+                    return;
+                }
+                this.lastGeometry = seen;
                 return;
             }
 
