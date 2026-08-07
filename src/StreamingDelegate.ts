@@ -687,7 +687,14 @@ export abstract class StreamingDelegate<T extends CameraController> implements C
     const seconds = this.config.prebufferSeconds || 0;
     if (!this.config.prebufferRtspBase || seconds <= 0)
       return 4000;
-    return Math.min(seconds * 1000, 15000);
+
+    // Never advertise more history than the ring actually retains. The two values are
+    // independent config fields and JSON Schema cannot express "this one must not exceed
+    // that one", so nothing stops a 15s pre-roll on a 5s ring. Since the hub KEEPS what we
+    // advertise, that combination promises 15s and delivers 5 — silently, because every
+    // layer reports success. Clamp to the smaller of the two.
+    const retained = this.config.prebufferRetainSeconds || 15;
+    return Math.min(seconds * 1000, retained * 1000, 15000);
   }
 
   protected prebufferManager(): PrebufferManager | undefined {

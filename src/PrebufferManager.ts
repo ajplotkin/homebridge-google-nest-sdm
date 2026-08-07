@@ -519,6 +519,16 @@ class CameraBuffer {
             this.pending = Buffer.alloc(0);
             this.pendingMoof = undefined;
 
+            // The clamp window is per-run too, and forgetting that is harmful rather than
+            // merely untidy. A run that dies holding, say, 15 clamps inside the last 10s
+            // hands them to its replacement, which respawns after a >=1s backoff — still
+            // inside the window. A handful of ordinary clamps from the NEW run then crosses
+            // the threshold on a mixed count, and the burst detector kills a healthy reader
+            // and destroys the in-flight consumer it was feeding, truncating a live
+            // recording. Every other piece of per-run parse state is reset here; this was
+            // the one that was not.
+            this.dtsClamps = [];
+
             this.resetConsumers("prebuffer reader restarted; timeline discontinuity");
 
             // Reset backoff if it had been healthy: a stream that ran for minutes
@@ -859,12 +869,27 @@ export class PrebufferManager {
         // pre-trigger footage and then hung, and the hub discards the clip entirely on timeout.
         let deadman: NodeJS.Timeout | undefined;
 
+        // Set once EOF has been pushed. Everything that could push afterwards must check it:
+        // `stream.push(chunk)` after `push(null)` throws ERR_STREAM_PUSH_AFTER_EOF, which
+        // destroys the stream WITH an error instead of ending it cleanly -- turning the
+        // slightly-short clip the deadman exists to save into an errored one. Reachable
+        // whenever the recorder is applying backpressure (flowing === false, fragments still
+        // queued) at the moment the reader stalls: the deadman fires, then the consumer
+        // drains, read() calls pump(), and pump pushes into an ended stream.
+        let ended = false;
+
         const armDeadman = () => {
             if (deadman) {
                 clearTimeout(deadman);
             }
             deadman = setTimeout(() => {
                 this.log.warn(`[prebuffer:${cameraKey}] no live fragment for ${LIVE_FLOW_DEADMAN_MS / 1000}s; closing the stream so the clip finalizes with the history we already sent`);
+                ended = true;
+                // Unsubscribe here rather than waiting for 'close'. Otherwise late live
+                // fragments keep re-arming this timer and piling into a queue nobody will
+                // ever read, until the overflow backstop or a reader restart clears it.
+                buf.subscribers.delete(onFragment);
+                queue.length = 0;
                 try {
                     stream?.push(null);
                 } catch (e) { /* already ended */ }
@@ -873,7 +898,7 @@ export class PrebufferManager {
         };
 
         const pump = () => {
-            if (!stream) {
+            if (!stream || ended) {
                 return;
             }
             while (queue.length) {
@@ -887,6 +912,9 @@ export class PrebufferManager {
         };
 
         const onFragment: FragmentSubscriber = (f: Buffer) => {
+            if (ended) {
+                return;
+            }
             armDeadman();
             // Backstop: if the consumer never drains (ffmpeg died before its stdin
             // was piped, or was killed while the reader was down so no write ever
