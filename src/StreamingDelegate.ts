@@ -99,6 +99,22 @@ export abstract class StreamingDelegate<T extends CameraController> implements C
     this.camera = camera;
     this.accessory = accessory;
 
+    // Start the ring NOW, not on the first updateRecordingActive(true). It exists to hold
+    // footage from BEFORE a trigger, so a ring that only warms once HomeKit toggles
+    // recording is empty at exactly the moment it is first needed. updateRecordingActive
+    // still stops it when the user turns recording off for a camera, and starts it again
+    // when they turn it back on.
+    try {
+      const key = this.prebufferKey();
+      const manager = this.prebufferManager();
+      if (key && manager && (this.config.prebufferSeconds || 0) > 0) {
+        manager.ensure(key);
+        this.log.info(`[prebuffer:${key}] ring started (${this.config.prebufferSeconds}s pre-roll configured)`);
+      }
+    } catch (e) {
+      this.log.error('Prebuffer could not be started: ' + e, this.camera.getDisplayName());
+    }
+
     api.on(APIEvent.SHUTDOWN, () => {
       for (const session in this.ongoingSessions) {
         this.stopStream(session);
@@ -606,14 +622,19 @@ export abstract class StreamingDelegate<T extends CameraController> implements C
       nestStreamer: nestStreamer
     }
 
-    await hksvStreamer.start();
-    if (!hksvStreamer || hksvStreamer.destroyed) {
-      throw new Error('Streaming server already closed.')
-    }
-
     const pending: Array<Buffer> = [];
 
     try {
+      // start() belongs INSIDE the try. Outside it, a failure to start (port bind,
+      // spawn error, destroy racing the listen) threw before the finally existed, so
+      // the prebuffer consumer stayed subscribed and its queue grew until the
+      // 240-fragment backstop destroyed it minutes later. Inside, the finally below
+      // releases it immediately on every failure path.
+      await hksvStreamer.start();
+      if (!hksvStreamer || hksvStreamer.destroyed) {
+        throw new Error('Streaming server already closed.')
+      }
+
       for await (const box of this.recordingSessionInfo.hksvStreamer.generator()) {
         pending.push(box.header, box.data);
 
